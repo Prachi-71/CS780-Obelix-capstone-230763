@@ -1,139 +1,169 @@
+"""
+agent.py — PPO Submission Wrapper for OBELIX (Codabench)
+=========================================================
+Compatible with evaluate.py calling: policy(obs, rng) -> action_str
+                                      reset_episode()
+
+Weight loading priority (first found wins):
+  1. ppo_finetuned_2.pth
+  2. ppo_tuned_final.pth
+  3. ppo_finetuned.pth
+  4. ppo_weights_bc.pth
+  5. ppo_weights.pth
+"""
+
 import os
 import random
-from collections import deque
 
-# Headless environment setup
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
 
-# --- Constants ---
-ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
-S_FAR = [0, 2, 4, 6, 8, 10, 12, 14]
-FORWARD_SENSORS = [6, 7, 8, 9] # S3/S4 Far and Near bits
+# ── Constants ────────────────────────────────────────────────────────────
+ACTIONS       = ["L45", "L22", "FW", "R22", "R45"]
+N_ACTIONS     = 5
+N_OBS         = 18
+STACK_SIZE    = 4
+N_OBS_STACKED = N_OBS * STACK_SIZE  # 72
 
+WEIGHTS_PRIORITY = [
+    "ppo_tuned_final.pth"
+]
+
+EVAL_EPSILON = 0.10   # Wanderer Fix: 10% random to escape Roomba Trap
+
+# ── Optional heavy imports (failures won't block policy definition) ───────
 try:
     import numpy as np
     import torch
     import torch.nn as nn
+    from collections import deque
     _IMPORTS_OK = True
-except Exception:
+except Exception as _import_err:
+    print(f"[agent.py] Import error: {_import_err}")
     _IMPORTS_OK = False
 
-# --- PPO Model Architecture ---
+
+# ── Classes (only defined if imports OK) ─────────────────────────────────
 if _IMPORTS_OK:
+
+    class FrameStacker:
+        def __init__(self):
+            self.reset()
+
+        def reset(self):
+            self.frames = deque(
+                [np.zeros(N_OBS, dtype=np.float32)] * STACK_SIZE,
+                maxlen=STACK_SIZE,
+            )
+
+        def push(self, obs):
+            self.frames.append(np.asarray(obs, dtype=np.float32))
+
+        def get_state(self):
+            return np.concatenate(list(self.frames))   # (72,)
+
+
     class ActorCritic(nn.Module):
-        def __init__(self, state_dim=72, action_dim=5):
+        def __init__(self, state_dim, action_dim):
             super().__init__()
             self.actor = nn.Sequential(
                 nn.Linear(state_dim, 128), nn.Tanh(),
-                nn.Linear(128, 64), nn.Tanh(),
+                nn.Linear(128, 64),        nn.Tanh(),
                 nn.Linear(64, action_dim),
-                nn.Softmax(dim=-1)
+                nn.Softmax(dim=-1),
+            )
+            self.critic = nn.Sequential(
+                nn.Linear(state_dim, 128), nn.Tanh(),
+                nn.Linear(128, 64),        nn.Tanh(),
+                nn.Linear(64, 1),
             )
 
-    class PPOInference:
+
+    class PPOAgentWrapper:
         def __init__(self):
-            self.net = ActorCritic()
-            self.stacker = deque(maxlen=4)
-            self._load_weights()
+            self.device  = torch.device("cpu")
+            self.policy  = ActorCritic(N_OBS_STACKED, N_ACTIONS).to(self.device)
+            self.stacker = FrameStacker()
+            self._loaded = False
+            self._load()
 
-        def _load_weights(self):
-            """Robust loader to handle the state_dict key mismatch"""
-            for f in ["ppo_tuned_final.pth"]:
-                if not os.path.exists(f):
-                    continue
-                try:
-                    ckpt = torch.load(f, map_location="cpu", weights_only=True)
-                    
-                    # Extract the dictionary if it's a full checkpoint
-                    state_dict = ckpt["actor"] if (isinstance(ckpt, dict) and "actor" in ckpt) else ckpt
-                    
-                    # Fix "0.weight" vs "actor.0.weight" mismatch
-                    first_key = list(state_dict.keys())[0]
-                    if first_key.startswith("0.") or first_key.startswith("2."):
-                        state_dict = {f"actor.{k}": v for k, v in state_dict.items()}
+        def _load(self):
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            weights_path = None
+            for fname in WEIGHTS_PRIORITY:
+                candidate = os.path.join(current_dir, fname)
+                if os.path.exists(candidate):
+                    weights_path = candidate
+                    break
 
-                    self.net.load_state_dict(state_dict, strict=False)
-                    self.net.eval()
-                    print(f"Agent weights loaded successfully: {f}")
-                    return
-                except Exception as e:
-                    print(f"Could not load {f}: {e}")
+            if weights_path is None:
+                print(f"[agent.py] WARNING: No weights found — using random policy.")
+                print(f"[agent.py] Searched: {WEIGHTS_PRIORITY}")
+                return
 
-        def get_action(self, obs):
-            if not _IMPORTS_OK: return 2 # Default to Forward
-            # Initialize stacker if empty
-            if len(self.stacker) == 0:
-                for _ in range(4): self.stacker.append(obs)
-            self.stacker.append(obs)
-            
-            # Prepare tensor
-            state = torch.FloatTensor(np.concatenate(list(self.stacker))).unsqueeze(0)
+            try:
+                ckpt = torch.load(weights_path, map_location=self.device, weights_only=True)
+                if "full" in ckpt:
+                    self.policy.load_state_dict(ckpt["full"])
+                elif "actor" in ckpt and "critic" in ckpt:
+                    self.policy.actor.load_state_dict(ckpt["actor"])
+                    self.policy.critic.load_state_dict(ckpt["critic"])
+                else:
+                    self.policy.load_state_dict(ckpt)
+                self.policy.eval()
+                self._loaded = True
+                print(f"[agent.py] Loaded: {os.path.basename(weights_path)}")
+            except Exception as e:
+                print(f"[agent.py] ERROR loading weights: {e}")
+
+        def act(self, obs):
+            self.stacker.push(obs)
+            state_t = torch.FloatTensor(
+                self.stacker.get_state()).unsqueeze(0).to(self.device)
+
             with torch.no_grad():
-                probs = self.net.actor(state)
-                return torch.argmax(probs, dim=1).item()
+                probs = self.policy.actor(state_t)
+                if np.random.rand() < EVAL_EPSILON:
+                    action_idx = np.random.randint(0, N_ACTIONS)
+                else:
+                    action_idx = torch.argmax(probs, dim=1).item()
 
-class OBELIXAgent:
-    def __init__(self):
-        self.ppo = PPOInference() if _IMPORTS_OK else None
-        self.parallel_side = None
-        self.is_avoiding_wall = False
+            return ACTIONS[action_idx]
 
-    def _classify_object(self, obs):
-        """
-        Differentiates objects based on sensor firing density.
-        RL agents often struggle with aliasing (box vs wall looking same).
-        """
-        active_far = sum(obs[i] for i in S_FAR)
-        # 1-3 sensors firing = discrete object (Box)
-        # 4+ sensors firing = continuous surface (Wall)
-        return "WALL" if active_far >= 4 else "BOX"
+        def reset(self):
+            self.stacker.reset()
 
-    def act(self, obs):
-        # 1. Get the primary intent from the PPO network
-        ppo_idx = self.ppo.get_action(obs) if self.ppo else 2
-        ppo_action = ACTIONS[ppo_idx]
-        
-        # 2. Analyze environment state
-        obj_type = self._classify_object(obs)
-        is_blocked = any(obs[i] == 1 for i in FORWARD_SENSORS)
 
-        # 3. Decision Logic:
-        # If the PPO sees a BOX, we let the RL stay in 100% control.
-        if obj_type == "BOX":
-            self.is_avoiding_wall = False
-            self.parallel_side = None
-            return ppo_action
+# ── Singleton ─────────────────────────────────────────────────────────────
+_agent = None
 
-        # If it's a WALL and we're blocked, we trigger a safety parallel nudge.
-        if obj_type == "WALL" and is_blocked:
-            self.is_avoiding_wall = True
-            if self.parallel_side is None:
-                # Move toward the side with fewer active sensors (cleaner path)
-                self.parallel_side = "LEFT" if sum(obs[0:6]) < sum(obs[10:16]) else "RIGHT"
-            return "L22" if self.parallel_side == "LEFT" else "R22"
+def _init_agent():
+    """Lazy-initialize the agent singleton."""
+    global _agent
+    if _agent is not None:
+        return
+    if _IMPORTS_OK:
+        try:
+            _agent = PPOAgentWrapper()
+        except Exception as e:
+            print(f"[agent.py] Agent init error: {e}")
+    else:
+        print("[agent.py] Heavy imports unavailable — falling back to random policy.")
 
-        # If the wall is no longer blocking our front, turn back in to find the gap.
-        if self.is_avoiding_wall and not is_blocked:
-            self.is_avoiding_wall = False
-            prev_side = self.parallel_side
-            self.parallel_side = None
-            return "L45" if prev_side == "LEFT" else "R45"
 
-        # Otherwise, trust the trained PPO behavior
-        return ppo_action
-
-    def reset(self):
-        if self.ppo:
-            self.ppo.stacker.clear()
-        self.parallel_side = None
-        self.is_avoiding_wall = False
-
-# --- Codabench/Evaluation Hooks ---
-_agent_instance = OBELIXAgent()
+# ── PUBLIC API (always present at module level — evaluate.py checks these) ─
 
 def policy(obs, rng=None):
-    return _agent_instance.act(obs)
+    """Select an action given an observation. Required by evaluate.py."""
+    _init_agent()
+    if _agent is not None:
+        return _agent.act(obs)
+    # Emergency random fallback (no torch/numpy required)
+    return random.choice(ACTIONS)
+
 
 def reset_episode():
-    _agent_instance.reset()
+    """Reset per-episode state. Required by evaluate.py."""
+    global _agent
+    if _agent is not None:
+        _agent.reset()
